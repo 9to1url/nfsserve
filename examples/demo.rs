@@ -354,11 +354,28 @@ impl NFSFileSystem for DemoFS {
     #[allow(unused)]
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let newid: fileid3;
+        {
+            let mut fs = self.fs.lock().unwrap();
+            newid = fs.len() as fileid3;
+            fs.push(make_dir(
+                std::str::from_utf8(dirname).unwrap(),
+                newid,
+                dirid,
+                Vec::new(),
+            ));
+            if let FSContents::Directory(dir) = &mut fs[dirid as usize].contents {
+                dir.push(newid);
+            } else {
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
+            }
+        }
+        Ok((newid, self.getattr(newid).await.unwrap()))
     }
+
 
     async fn symlink(
         &self,
@@ -382,7 +399,8 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), DemoFS::default())
+    // only change from 127.0.0.1 to 0.0.0.0 if you want to access from external
+    let listener = NFSTcpListener::bind(&format!("0.0.0.0:{HOSTPORT}"), DemoFS::default())
         .await
         .unwrap();
     listener.handle_forever().await.unwrap();
