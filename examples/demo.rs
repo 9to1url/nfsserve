@@ -334,8 +334,32 @@ impl NFSFileSystem for DemoFS {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        let mut fs = self.fs.lock().unwrap();
+    
+        // First, get the list of children IDs without mutable borrowing conflict
+        let children_ids = match &fs.get(dirid as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?.contents {
+            FSContents::Directory(children) => children.clone(),
+            _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+        };
+    
+        // Find position separately without conflicting borrow
+        let fileid_to_remove = children_ids.iter().find(|&&fileid| {
+            fs[fileid as usize].name.0 == filename.0
+        }).copied();
+    
+        // Now safely borrow mutably again
+        if let Some(fileid) = fileid_to_remove {
+            if let FSContents::Directory(children) = &mut fs[dirid as usize].contents {
+                children.retain(|&id| id != fileid);
+            }
+            fs[fileid as usize] = make_file("", fileid, 0, &[]);
+            return Ok(());
+        }
+    
+        Err(nfsstat3::NFS3ERR_NOENT)
     }
+
+
 
     /// Removes a file.
     /// If not supported dur to readonly file system
