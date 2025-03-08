@@ -16,6 +16,7 @@ enum FSContents {
     File(Vec<u8>),
     Directory(Vec<fileid3>),
 }
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct FSEntry {
@@ -73,6 +74,17 @@ fn make_dir(name: &str, id: fileid3, parent: fileid3, contents: Vec<fileid3>) ->
         name: name.as_bytes().into(),
         parent,
         contents: FSContents::Directory(contents),
+    }
+}
+
+// Helper function to get the current server time as an nfstime3
+fn now_nfstime() -> nfstime3 {
+    let d = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    nfstime3 {
+        seconds: d.as_secs() as u32,
+        nseconds: d.subsec_nanos(),
     }
 }
 
@@ -137,9 +149,9 @@ impl NFSFileSystem for DemoFS {
                 let offset = offset as usize;
                 if offset + data.len() > bytes.len() {
                     bytes.resize(offset + data.len(), 0);
-                    bytes[offset..].copy_from_slice(data);
-                    fssize = bytes.len() as u64;
                 }
+                bytes[offset..offset + data.len()].copy_from_slice(data);
+                fssize = bytes.len() as u64;
             }
             fs[id as usize].attr.size = fssize;
             fs[id as usize].attr.used = fssize;
@@ -166,6 +178,9 @@ impl NFSFileSystem for DemoFS {
             if let FSContents::Directory(dir) = &mut fs[dirid as usize].contents {
                 dir.push(newid);
             }
+            // Update the parent directory's timestamps
+            fs[dirid as usize].attr.mtime = now_nfstime();
+            fs[dirid as usize].attr.ctime = fs[dirid as usize].attr.mtime;
         }
         Ok((newid, self.getattr(newid).await.unwrap()))
     }
@@ -202,11 +217,13 @@ impl NFSFileSystem for DemoFS {
         }
         Err(nfsstat3::NFS3ERR_NOENT)
     }
+
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let fs = self.fs.lock().unwrap();
         let entry = fs.get(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
         Ok(entry.attr)
     }
+
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let mut fs = self.fs.lock().unwrap();
         let entry = fs.get_mut(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
@@ -329,35 +346,75 @@ impl NFSFileSystem for DemoFS {
         Err(nfsstat3::NFS3ERR_NOENT)
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[allow(unused)]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        let mut fs = self.fs.lock().unwrap();
+
+        // First, get the list of children IDs without mutable borrowing conflict
+        let children_ids = match &fs.get(dirid as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?.contents {
+            FSContents::Directory(children) => children.clone(),
+            _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+        };
+
+        // Find position separately without conflicting borrow
+        let fileid_to_remove = children_ids.iter().find(|&&fileid| {
+            fs[fileid as usize].name.0 == filename.0
+        }).copied();
+
+        // Now safely borrow mutably again
+        if let Some(fileid) = fileid_to_remove {
+            if let FSContents::Directory(children) = &mut fs[dirid as usize].contents {
+                children.retain(|&id| id != fileid);
+            }
+            fs[fileid as usize] = make_file("", fileid, 0, &[]);
+
+            // Update the parent directory's timestamps
+            fs[dirid as usize].attr.mtime = now_nfstime();
+            fs[dirid as usize].attr.ctime = fs[dirid as usize].attr.mtime;
+
+            return Ok(());
+        }
+
+        Err(nfsstat3::NFS3ERR_NOENT)
     }
 
-    /// Removes a file.
-    /// If not supported dur to readonly file system
-    /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[allow(unused)]
     async fn rename(
         &self,
-        from_dirid: fileid3,
-        from_filename: &filename3,
-        to_dirid: fileid3,
-        to_filename: &filename3,
+        _from_dirid: fileid3,
+        _from_filename: &filename3,
+        _to_dirid: fileid3,
+        _to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     #[allow(unused)]
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let newid: fileid3;
+        {
+            let mut fs = self.fs.lock().unwrap();
+            newid = fs.len() as fileid3;
+            fs.push(make_dir(
+                std::str::from_utf8(dirname).unwrap(),
+                newid,
+                dirid,
+                Vec::new(),
+            ));
+            if let FSContents::Directory(dir) = &mut fs[dirid as usize].contents {
+                dir.push(newid);
+            } else {
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
+            }
+            // Update the parent directory's timestamps
+            fs[dirid as usize].attr.mtime = now_nfstime();
+            fs[dirid as usize].attr.ctime = fs[dirid as usize].attr.mtime;
+        }
+        Ok((newid, self.getattr(newid).await.unwrap()))
     }
 
     async fn symlink(
@@ -369,8 +426,9 @@ impl NFSFileSystem for DemoFS {
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
+
     async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
-        return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 }
 
@@ -382,10 +440,13 @@ async fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
+
+    // Use 0.0.0.0 for external access, or 127.0.0.1 for local only
     let listener = NFSTcpListener::bind(&format!("0.0.0.0:{HOSTPORT}"), DemoFS::default())
         .await
         .unwrap();
+
     listener.handle_forever().await.unwrap();
 }
-// Test with
-// mount -t nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000,soft 127.0.0.1:/ mnt/
+// Test with e.g.:
+// mount -t nfs -o nolocks,vers=3,tcp,port=11111,mountport=11111,soft 127.0.0.1:/ mnt/
